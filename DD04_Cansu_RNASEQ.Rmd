@@ -1,0 +1,817 @@
+---
+title: "DD04-CANSU_RNASEQ"
+author: "Chandrima"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r}
+path = "C:/Sen_lab_2025/DD04_Cansu/output_data_folder/RNA_Seq"
+```
+
+# Loading Libraries
+
+```{r}
+#set.seed(8675309) #if you set a random seed, your data will be perfectly reproducible but be careful!!
+packages <- c ("stringr","ggplot2", "reshape2", "RColorBrewer", "pheatmap","DESeq2","fgsea","openxlsx",
+               "readr", "tidyverse", "gridExtra", "vegan", "ggrepel","vsn", "sva", "cowplot", "ggrepel",
+               "TxDb.Hsapiens.UCSC.hg19.knownGene","clusterProfiler","org.Hs.eg.db", "vsn", "sva", "rGREAT",
+               "ChIPpeakAnno", "GGally", "ChIPseeker", "tximport","rhdf5", "edgeR")
+
+#Load libraries
+lapply(packages, suppressPackageStartupMessages(library), character.only = T)
+```
+
+```{r}
+#Loading .h5 files
+files <- list.files(path = paste0(path,"/quant/"),pattern = "abundance.h5", recursive = TRUE)
+exclude <- c("quant/DD04_A45_M_S18/abundance.h5", "quant/DD04_C45_DMSO_S21/abundance.h5")
+files <- files[!files %in% exclude]
+names(files) <- basename(dirname(files)) 
+genepc <- read_tsv(paste0(path,"/gene_biotypes.GRCh38.111.txt"))
+tx2gene <- read_tsv(paste0(path,"/tx2gene_Homo_sapiens_GRCh38.111.txt"))
+
+txi.kallisto <- tximport(paste0(path,"/quant/",files), type = "kallisto", tx2gene = tx2gene, ignoreAfterBar = TRUE)
+
+# Changing colnames
+colnames(txi.kallisto$abundance) <- names(files)
+colnames(txi.kallisto$counts) <- names(files)
+
+# Setting rownames
+rows <- data.frame(matrix(ncol = 0, nrow = nrow(txi.kallisto$counts)))
+rows$gene_id <- rownames(txi.kallisto$counts)
+
+rows <- rows %>%
+  left_join(
+    genepc %>%
+      distinct(gene_id, .keep_all = TRUE) %>%  # Keep first unique gene_id
+      select(gene_id, gene_symbol),
+    by = "gene_id"
+  )
+rownames(txi.kallisto$abundance) <- rows$gene_symbol
+rownames(txi.kallisto$counts) <- rows$gene_symbol
+
+head(txi.kallisto$counts)
+
+# Locating mitochondrial genes
+mitogene <- genepc[grepl("^MT-",genepc$gene_symbol), ]
+
+# Loading Metadata
+metadata <- read.xlsx(paste0(path,"/DD04_RNA_Metadata.xlsx"), sheet = 1)
+rownames(metadata) <- metadata$SampleName
+
+metadata <- metadata[rownames(metadata) %in% colnames(txi.kallisto$counts),]
+metadata <- metadata[colnames(txi.kallisto$counts),]
+metadata$Protocol <- as.factor(metadata$Protocol)
+
+# Making the experiment Table
+dfConditions <- metadata |> select(c(1,2,3)) |> mutate(grp = case_when(Protocol == "A" ~ "Acute",
+                                                                       Protocol == "C" ~ "Chronic",
+                                                                       Protocol == "R" ~ "Restim",
+                                                                       Protocol == "N" ~ "Naive",))
+dfConditions$Group <- paste0(dfConditions$grp, dfConditions$Drug)
+
+dfConditions <- dfConditions |> select(c(1,5))
+dfConditions$Group <- factor(dfConditions$Group)
+
+saveRDS(txi.kallisto, paste0(path, "/kallisto_object.rds"))
+
+#For WGCNA
+SampleMeta <- dfConditions |> select(c(1,3,4,5))
+write_tsv(SampleMeta, paste0(path, "/WGCNA_metadata.tsv"))
+```
+
+# TPM
+
+```{r}
+TPM <- as.data.frame(txi.kallisto$abundance)
+temp <- subset(TPM, subset = apply(TPM, 1,max) >= 1)
+logTPM <- log2(temp + 1)
+
+metadataGene <- metadata |> select(c(1,2,3))
+
+# G2M CHECKPOINT
+gmt.file <- read_tsv(paste0(path, "/Gene_Enrichment/HALLMARK_G2M_CHECKPOINT.v2024.1.Hs.tsv"))[17,2]
+gmt.file <- as.vector(gmt.file$HALLMARK_G2M_CHECKPOINT)
+gmt.file <- unlist(strsplit(gmt.file, ","))
+
+HALLMARK_G2M_CHECKPOINT <- logTPM |> filter(rownames(logTPM) %in% gmt.file)
+
+pathway_meanz <- as.numeric(colMeans(HALLMARK_G2M_CHECKPOINT, na.rm = TRUE))
+
+metadataGene$logTPM <- pathway_meanz
+
+ggplot(metadataGene, aes(x = factor(Protocol), y = logTPM, fill = factor(Drug))) + 
+      geom_boxplot(outlier.shape = NA) + 
+      geom_point(position = position_dodge(width = 0.75)) +
+      geom_smooth(method = "lm") +
+      xlab("Protocol") + 
+      ylab("logTPM")+
+      ggtitle("HALLMARK_G2M_CHECKPOINT")+
+      theme_bw()
+ggsave(paste0(path, "/Gene_Enrichment/hall_g2m_checkpoint_logTPM.png"), width = 4, height = 3)
+
+#Pathways enrichment KEGG
+gmt.file2 <- read_tsv(paste0(path,"/Gene_Enrichment/KEGG_HOMOLOGOUS_RECOMBINATION.v2024.1.Hs.tsv"))[17,2]
+gmt.file2 <- as.vector(gmt.file2$KEGG_HOMOLOGOUS_RECOMBINATION)
+gmt.file2 <- unlist(strsplit(gmt.file2, ","))
+
+
+# dfNormalizedCount <- read_tsv(paste0(sublocation,"/NormCountsRNA_without_d45_a_c.tsv")) |> column_to_rownames("ID")
+KEGG_HOMOLOGOUS_RECOMBINATION <- logTPM |> filter(rownames(logTPM) %in% gmt.file2)
+
+pathway_meanz.kegg <- as.numeric(colMeans(KEGG_HOMOLOGOUS_RECOMBINATION, na.rm = TRUE))
+
+metadataGene$logTPM_kegg <- pathway_meanz.kegg
+ggplot(metadataGene, aes(x = factor(Protocol), y = logTPM_kegg, fill = factor(Drug))) + 
+  geom_boxplot(outlier.shape = NA) + 
+  geom_point(position = position_dodge(width = 0.75)) +
+  geom_smooth(method = "lm") +
+  xlab("Protocol") + 
+  ylab("logTPM")+
+  ggtitle("KEGG_HOMOLOGOUS_RECOMBINATION")+
+  theme_bw()
+ggsave(paste0(path, "/Gene_Enrichment/kegg_homologous_recombination_logTPM.png"), width = 4, height = 3)
+
+
+goi <- c("ACTB", "CCR7", "CD3E", "CD8A", "CD8B", "ENTPD1", "EOMES", 
+           "FOXO1", "FOXO4", "GAPDH", "GZMA", "GZMB", "GZMK", "IFNG", 
+           "IL2", "IL7R", "NFATC1", "PDCD1", "RUNX1", "RUNX2", "RUNX3", 
+           "TBX21", "TCF7", "TOX", "TNF", "PRF1", "CXCR4", "GATA3")
+
+
+metadataGene <- metadata |> select(c(1,2,3))
+# Plotting GENE OF INTEREST
+for (i in goi){
+  if (i %in% rownames(logTPM)){
+    metadataGene[[i]] <- as.numeric(logTPM[which(rownames(logTPM) == i),])
+    ggplot(metadataGene, aes(x = factor(Protocol), y = metadataGene[[i]], fill = factor(Drug))) + 
+      geom_boxplot(outlier.shape = NA) + 
+      geom_point(position = position_dodge(width = 0.75)) +
+      geom_smooth(method = "lm") +
+      xlab("Protocol") + 
+      ylab(paste(i,"logTPM"))
+      theme_bw()
+      ggsave(paste0(path,"/Exploratory_Analysis/Gene_of_Interest_logTPM/",i,"_logTPM_without_d45_A_C.png"),width = 6, height = 4)
+  }
+}
+```
+
+# For Transcript Length Corrected Analysis
+
+```{r}
+#DESeq2
+dds <- DESeqDataSetFromTximport(txi.kallisto, dfConditions, ~Group)
+
+#remove low quality reads
+dds <- subset(dds, subset = apply(assay(dds), 1,max) >= 10)
+dds <- dds[!rownames(dds) %in% mitogene$gene_symbol,]
+
+deRNA <- DESeq(dds)
+```
+
+# For unnormalised Transcript corrected library
+
+```{r}
+TPMcounts <- data.frame(assay(deRNA))
+metadataGene <- metadata |> select(c(1,2,3))
+
+# For TPM length adjusted counts
+for (i in goi){
+  if (i %in% rownames(TPMcounts)){
+    metadataGene[[i]] <- as.numeric(TPMcounts[which(rownames(TPMcounts) == i),])
+    ggplot(metadataGene, aes(x = factor(Protocol), y = metadataGene[[i]], fill = factor(Drug))) + 
+      geom_boxplot(outlier.shape = NA) + 
+      geom_point(position = position_dodge(width = 0.75)) +
+      geom_smooth(method = "lm") +
+      xlab("Protocol") + 
+      ylab(paste(i,"TPM corrected library"))
+      theme_bw()
+      ggsave(paste0(path,"/Exploratory_Analysis/Gene_of_Interest_TPM_GeneCounts/",i,"_TPM_GeneCounts_without_d45_A_C.png"),width = 6, height = 4)
+  }
+}
+
+#PCA
+# Filter any various beyond 0.2
+dfTPMCountsFilter <- varFilter(as.matrix(TPMcounts), var.cutoff = 0.2, filterByQuantile = T)
+
+# Run PCA
+dfTPMCountsPCA <- prcomp(t(dfTPMCountsFilter), center = T, scale. = T)
+
+# Calculate the Percentage of Variance Explained by PCs
+percentVar <- ((dfTPMCountsPCA$sdev)^2 / sum(dfTPMCountsPCA$sdev^2)) * 100
+
+#Plot for PCs
+cowplot::plot_grid(ncol = 2,
+                   ggplot(dfTPMCountsPCA$x, 
+                          aes(x= dfTPMCountsPCA$x[,1], y = dfTPMCountsPCA$x[,2], colour = dfConditions$Group))+
+                     geom_point(size = 3)+
+                     xlab( paste0("PC1: ", round(percentVar[1]), "%"))+
+                     ylab(paste0("PC2: ", round(percentVar[2]), "%"))+
+                     scale_color_manual(name = "", values = c( "NaiveNA" = "darkgrey",
+                                           "AcuteDMSO" = "#1B7837",
+                                           "AcuteM" = "#7FBF7B",
+                                           "ChronicM" = "#FC8D59",
+                                           "ChronicDMSO"= "#D73027",
+                                           "RestimNA" = "#7570B3")),
+                ggplot(dfTPMCountsPCA$x, 
+                       aes(x= dfTPMCountsPCA$x[,1], y = dfTPMCountsPCA$x[,3], colour = dfConditions$Group))+
+                       geom_point(size = 3)+
+                       xlab( paste0("PC1: ", round(percentVar[1]), "%"))+
+                       ylab(paste0("PC3: ", round(percentVar[3]), "%"))+
+                       scale_color_manual(name = "", values = c( "NaiveNA" = "darkgrey",
+                                           "AcuteDMSO" = "#1B7837",
+                                           "AcuteM" = "#7FBF7B",
+                                           "ChronicM" = "#FC8D59",
+                                           "ChronicDMSO"= "#D73027",
+                                           "RestimNA" = "#7570B3")),
+                ggplot(dfTPMCountsPCA$x, 
+                       aes(x= dfTPMCountsPCA$x[,2], y = dfTPMCountsPCA$x[,3], colour = dfConditions$Group))+
+                       geom_point(size = 3)+
+                       xlab( paste0("PC2: ", round(percentVar[2]), "%"))+
+                       ylab(paste0("PC3: ", round(percentVar[3]), "%"))+
+                       scale_color_manual(name = "", values = c( "NaiveNA" = "darkgrey",
+                                           "AcuteDMSO" = "#1B7837",
+                                           "AcuteM" = "#7FBF7B",
+                                           "ChronicM" = "#FC8D59",
+                                           "ChronicDMSO"= "#D73027",
+                                           "RestimNA" = "#7570B3"))
+)
+
+ggsave(paste0(path, "/Exploratory_Analysis/PCA_TPMCounts.png"), width = 8, height = 6)
+
+# Correlation between samples
+
+# Create Correlation co-efficient matrix
+sampleCorTPM <- cor(TPMcounts,  method = "spearman")
+
+# Add row/column names if needed
+rownames(sampleCorTPM) <- dfConditions$Group
+colnames(sampleCorTPM) <- dfConditions$Group
+
+# Create color palette
+colors <- colorRampPalette(brewer.pal(9, "Blues"))(100)
+
+# Create heatmap
+pheatmap(sampleCorTPM,
+         # clustering_distance_rows = "euclidean",clustering_distance_cols = "euclidean",
+         cluster_rows = T, cluster_cols = T,
+         col = colors, filename = paste0(path, "/Exploratory_Analysis/TPMCounts_Correlation.png"), width = 6, height = 6)
+
+#Pathways selected
+HALLMARK_G2M_CHECKPOINT <- NULL
+KEGG_HOMOLOGOUS_RECOMBINATION <- NULL
+
+# G2M_CHECKPOINT
+HALLMARK_G2M_CHECKPOINT <- TPMcounts |> filter(rownames(TPMcounts) %in% gmt.file)
+
+pathway_meanz <- as.numeric(colMeans(HALLMARK_G2M_CHECKPOINT, na.rm = TRUE))
+
+metadataGene <- metadata |> select(c(1,2,3))
+metadataGene$TPMcounts <- pathway_meanz
+
+ggplot(metadataGene, aes(x = factor(Protocol), y = TPMcounts, fill = factor(Drug))) + 
+      geom_boxplot(outlier.shape = NA) + 
+      geom_point(position = position_dodge(width = 0.75)) +
+      geom_smooth(method = "lm") +
+      xlab("Protocol") + 
+      ylab("TPM corrected library")+
+      ggtitle("HALLMARK_G2M_CHECKPOINT")+
+      theme_bw()
+ggsave(paste0(path, "/Gene_Enrichment/hall_g2m_checkpoint_TPMcounts.png"), width = 4, height = 3)
+
+# KEGG_HOMOLOGOUS_RECOMBINATION 
+KEGG_HOMOLOGOUS_RECOMBINATION <- TPMcounts |> filter(rownames(TPMcounts) %in% gmt.file2)
+
+pathway_meanz.kegg <- as.numeric(colMeans(KEGG_HOMOLOGOUS_RECOMBINATION, na.rm = TRUE))
+
+metadataGene$TPMcounts_kegg <- pathway_meanz.kegg
+ggplot(metadataGene, aes(x = factor(Protocol), y = TPMcounts_kegg, fill = factor(Drug))) + 
+  geom_boxplot(outlier.shape = NA) + 
+  geom_point(position = position_dodge(width = 0.75)) +
+  geom_smooth(method = "lm") +
+  xlab("Protocol") + 
+  ylab("TPM corrected library")+
+  ggtitle("KEGG_HOMOLOGOUS_RECOMBINATION")+
+  theme_bw()
+ggsave(paste0(path, "/Gene_Enrichment/kegg_homologous_recombination_TPMcounts.png"), width = 4, height = 3)
+
+
+```
+
+# For Normalised Transcript corrected library
+
+```{r}
+TPMCountsNorm <- as.data.frame(counts(deRNA, normalized = T))
+metadataGene <- metadata |> select(c(1,2,3))
+
+# For TPM length adjusted counts
+for (i in goi){
+  if (i %in% rownames(TPMCountsNorm)){
+    metadataGene[[i]] <- as.numeric(TPMCountsNorm[which(rownames(TPMCountsNorm) == i),])
+    ggplot(metadataGene, aes(x = factor(Protocol), y = metadataGene[[i]], fill = factor(Drug))) + 
+      geom_boxplot(outlier.shape = NA) + 
+      geom_point(position = position_dodge(width = 0.75)) +
+      geom_smooth(method = "lm") +
+      xlab("Protocol") + 
+      ylab(paste(i,"Normalized TPM corrected library"))
+      theme_bw()
+      ggsave(paste0(path,"/Exploratory_Analysis/Gene_of_Interest_TPM_GeneCounts_Norm/",i,"_TPM_GeneCounts_Norm_without_d45_A_C.png"),width = 6, height = 4)
+  }
+}
+
+#PCA
+# Filter any various beyond 0.2
+dfTPMCountsNormFilter <- varFilter(as.matrix(TPMCountsNorm), var.cutoff = 0.2, filterByQuantile = T)
+
+# Run PCA
+dfTPMCountsNormPCA <- prcomp(t(dfTPMCountsNormFilter), center = T, scale. = T)
+
+# Calculate the Percentage of Variance Explained by PCs
+percentVar <- ((dfTPMCountsNormPCA$sdev)^2 / sum(dfTPMCountsNormPCA$sdev^2)) * 100
+
+#Plot for PCs
+cowplot::plot_grid(ncol = 2,
+                   ggplot(dfTPMCountsNormPCA$x, 
+                          aes(x= dfTPMCountsNormPCA$x[,1], y = dfTPMCountsNormPCA$x[,2], colour = dfConditions$Group))+
+                     geom_point(size = 3)+
+                     xlab( paste0("PC1: ", round(percentVar[1]), "%"))+
+                     ylab(paste0("PC2: ", round(percentVar[2]), "%"))+
+                     scale_color_manual(name = "", values = c( "NaiveNA" = "darkgrey",
+                                           "AcuteDMSO" = "#1B7837",
+                                           "AcuteM" = "#7FBF7B",
+                                           "ChronicM" = "#FC8D59",
+                                           "ChronicDMSO"= "#D73027",
+                                           "RestimNA" = "#7570B3")),
+                ggplot(dfTPMCountsNormPCA$x, 
+                       aes(x= dfTPMCountsNormPCA$x[,1], y = dfTPMCountsNormPCA$x[,3], colour = dfConditions$Group))+
+                       geom_point(size = 3)+
+                       xlab( paste0("PC1: ", round(percentVar[1]), "%"))+
+                       ylab(paste0("PC3: ", round(percentVar[3]), "%"))+
+                       scale_color_manual(name = "", values = c( "NaiveNA" = "darkgrey",
+                                           "AcuteDMSO" = "#1B7837",
+                                           "AcuteM" = "#7FBF7B",
+                                           "ChronicM" = "#FC8D59",
+                                           "ChronicDMSO"= "#D73027",
+                                           "RestimNA" = "#7570B3")),
+                ggplot(dfTPMCountsNormPCA$x, 
+                       aes(x= dfTPMCountsNormPCA$x[,2], y = dfTPMCountsNormPCA$x[,3], colour = dfConditions$Group))+
+                       geom_point(size = 3)+
+                       xlab( paste0("PC2: ", round(percentVar[2]), "%"))+
+                       ylab(paste0("PC3: ", round(percentVar[3]), "%"))+
+                       scale_color_manual(name = "", values = c( "NaiveNA" = "darkgrey",
+                                           "AcuteDMSO" = "#1B7837",
+                                           "AcuteM" = "#7FBF7B",
+                                           "ChronicM" = "#FC8D59",
+                                           "ChronicDMSO"= "#D73027",
+                                           "RestimNA" = "#7570B3"))
+)
+
+ggsave(paste0(path, "/Exploratory_Analysis/PCA_TPMCountsNorm.png"), width = 8, height = 6)
+
+# Correlation between samples
+
+# Create Correlation co-efficient matrix
+sampleCorTPMNorm <- cor(TPMCountsNorm,  method = "spearman")
+
+# Add row/column names if needed
+rownames(sampleCorTPMNorm) <- dfConditions$Group
+colnames(sampleCorTPMNorm) <- dfConditions$Group
+
+# Create color palette
+colors <- colorRampPalette(brewer.pal(9, "Blues"))(100)
+
+# Create heatmap
+pheatmap(sampleCorTPMNorm,
+         # clustering_distance_rows = "euclidean",clustering_distance_cols = "euclidean",
+         cluster_rows = T, cluster_cols = T,
+         col = colors, filename = paste0(path, "/Exploratory_Analysis/TPMCountsNorm_Correlation.png"), width = 6, height = 6)
+
+#Pathways selected
+HALLMARK_G2M_CHECKPOINT <- NULL
+KEGG_HOMOLOGOUS_RECOMBINATION <- NULL
+
+# G2M_CHECKPOINT
+HALLMARK_G2M_CHECKPOINT <- TPMCountsNorm |> filter(rownames(TPMCountsNorm) %in% gmt.file)
+
+pathway_meanz <- as.numeric(colMeans(HALLMARK_G2M_CHECKPOINT, na.rm = TRUE))
+
+metadataGene <- metadata |> select(c(1,2,3))
+metadataGene$TPMCountsNorm <- pathway_meanz
+
+ggplot(metadataGene, aes(x = factor(Protocol), y = TPMCountsNorm, fill = factor(Drug))) + 
+      geom_boxplot(outlier.shape = NA) + 
+      geom_point(position = position_dodge(width = 0.75)) +
+      geom_smooth(method = "lm") +
+      xlab("Protocol") + 
+      ylab("Normalized TPM corrected library")+
+      ggtitle("HALLMARK_G2M_CHECKPOINT")+
+      theme_bw()
+ggsave(paste0(path, "/Gene_Enrichment/hall_g2m_checkpoint_TPMcountsNorm.png"), width = 4, height = 3)
+
+# KEGG_HOMOLOGOUS_RECOMBINATION 
+KEGG_HOMOLOGOUS_RECOMBINATION <- TPMCountsNorm |> filter(rownames(TPMCountsNorm) %in% gmt.file2)
+
+pathway_meanz.kegg <- as.numeric(colMeans(KEGG_HOMOLOGOUS_RECOMBINATION, na.rm = TRUE))
+
+metadataGene$TPMCountsNorm_kegg <- pathway_meanz.kegg
+ggplot(metadataGene, aes(x = factor(Protocol), y = TPMCountsNorm_kegg, fill = factor(Drug))) + 
+  geom_boxplot(outlier.shape = NA) + 
+  geom_point(position = position_dodge(width = 0.75)) +
+  geom_smooth(method = "lm") +
+  xlab("Protocol") + 
+  ylab("Normalized TPM corrected library")+
+  ggtitle("KEGG_HOMOLOGOUS_RECOMBINATION")+
+  theme_bw()
+ggsave(paste0(path, "/Gene_Enrichment/kegg_homologous_recombination_TPMcountsNorm.png"), width = 4, height = 3)
+
+
+```
+
+# Making labels for merged dataframe for pairwise comparison
+
+```{r}
+# Combinations
+dfPairwiseCond <- as.data.frame(combn(levels(dfConditions$Group), 2))
+
+#Converting to list type
+liPairwiseCond <- as.list(dfPairwiseCond)
+liPairwiseCond <- lapply(liPairwiseCond, as.character)
+
+#Converting in labels into a vector after pasting the pairs
+groupLabels <- unlist(lapply(liPairwiseCond, function(x) {
+  paste0(x[[1]], "vs", x[[2]])}))
+```
+
+## Generate Comparison Results
+
+```{r}
+PairwiseComparison <- function(deseq, dfconditions) {
+  # # Initialize empty data frames to store results
+  # dfQvals <- data.frame()
+  # dfFoldC <- data.frame()
+  # dfPvals <- data.frame()
+  
+  # Loop through each comparison in dfconditions
+  for (i in seq_len(ncol(dfconditions))) {
+    # Comparing Row 1 vs Row 2 for each combination
+    comparison_name <- paste(dfconditions[1,i], "vs", dfconditions[2,i])
+    print(paste("Calculating results for comparison", comparison_name))
+    
+    # Get DESeq2 results for this comparison
+    resComp <- results(deseq, contrast = c("Group", dfconditions[1,i], dfconditions[2,i]))
+    write_tsv(as.data.frame(resComp)|> rownames_to_column("ID"), paste0(path,"/Differential_Accessible_regions_Analysis/Norm_TPMCounts/",dfconditions[1,i], "vs", dfconditions[2,i],".tsv"))
+    # # Add results to the respective data frames
+    # dfQvals[rownames(resComp), paste0(comparison_name, "_padj")] <- resComp$padj
+    # dfFoldC[rownames(resComp), paste0(comparison_name, "_fc")] <- resComp$log2FoldChange
+    # dfPvals[rownames(resComp), paste0(comparison_name, "_pval")] <- resComp$pvalue
+  }
+  
+  # Return all results as a list
+  # return(list(qvals = dfQvals, fc = dfFoldC, pvals = dfPvals))
+}
+```
+
+```{r}
+PairwiseComparison(deRNA, dfPairwiseCond)
+```
+
+## GSEA
+
+```{r}
+sublocation <- "Gene_Enrichment/GSEA_Transcript_length_corrected_library"
+if (!dir.exists(file.path(path, sublocation))){
+  dir.create(file.path(path, sublocation))
+  subpath <- file.path(path, sublocation)
+}else{
+  subpath <- file.path(path, sublocation)
+}
+
+# Extracting the GSEA data base using msigdbr
+library(msigdbr)
+
+# Fetch all C2 pathways (including Biocarta, KEGG, Reactome, etc.) for human
+msig_df <- msigdbr(
+  species = "Homo sapiens",
+  collection ="C2"
+)
+
+# Removing CGP pathways
+msig_df <- subset(msig_df, gs_subcollection != "CGP" )
+
+# Create TERM2GENE mapping
+term2gene <- msig_df |> select(gs_name, gene_symbol)
+
+#GSEA
+for (i in groupLabels){
+  # Loading acute vs chronic Untreated
+  df <- read_tsv(paste0(path,"/Differential_Accessible_regions_Analysis/Norm_TPMCounts/", i ,".tsv"))
+  
+  # Removing nan type padj and logfc
+  df <- df[!is.na(df$padj) & !is.na(df$log2FoldChange),]
+  
+  # Set padj == 0 to minimum of padj > 0
+  min_p <- min(df$padj[df$padj > 0], na.rm = TRUE)
+  df$padj[df$padj == 0] <- min_p
+
+  # Ranking the genelist my logfold change sign and -log10(padj) value
+  df <- df |> 
+    mutate(ranking_metric = -log10(padj)* sign(log2FoldChange)) |> 
+    arrange(desc(ranking_metric))
+  
+  # Extracting genelist and ranking_metric for GSEA
+  ranked_gene <- df$ranking_metric
+  names(ranked_gene) <- df$ID
+
+  set.seed(123)
+  # Gene Set Enrichment Test
+  df.gsea <- GSEA(
+    geneList = ranked_gene,
+    TERM2GENE = term2gene,
+    pvalueCutoff = 0.05,
+    minGSSize = 10,            
+    maxGSSize = 5000,
+    eps = 0,
+    seed = T
+  )
+  saveRDS(df.gsea, paste0(subpath, "/", i ,"_GSEA_canonical_pathways.rds"))
+  
+  # # Correct subsetting using clusterProfiler's method
+  # dna.Pathways.GSEA <- df.gsea |> filter(grepl('DNA', Description))
+  # 
+  # # Check if any pathways exist before plotting
+  # if (nrow(dna.Pathways.GSEA@result) > 0) {
+  #   # Plot all DNA pathways found
+  #   gseaplot2(dna.Pathways.GSEA, geneSetID = rownames(dna.Pathways.GSEA@result))
+  #   ggsave(paste0(subpath, "/", i,"_GSEA_DNA_damage_pathways.pdf"), width = 12, height = 6)
+  # } else {
+  #   message("No DNA pathways found for group: ", i)
+  # }
+}
+
+
+for (i in 7:length(groupLabels)) {
+  df <- readRDS(paste0(subpath, "/", groupLabels[10] ,"_GSEA_canonical_pathways.rds"))
+  dna.Pathways.GSEA <- df |> filter(grepl('DNA', Description))
+  pathway_ids <- rownames(dna.Pathways.GSEA@result)
+  # Check if any pathways exist before plotting
+  if (length(pathway_ids) > 0) {
+    # Plot all DNA pathways found
+    pdf(paste0(subpath, "/", groupLabels[13],"_GSEA_DNA_damage_pathways.pdf"), width = 12, height = 6)
+    gseaplot2(df, geneSetID = pathway_ids)
+    dev.off()
+    # ggsave(paste0(subpath, "/", groupLabels[7],"_GSEA_DNA_damage_pathways.pdf"), width = 12, height = 6)
+  } else {
+    message("No DNA pathways found for group: ", i)
+  }
+  
+}
+
+```
+
+```{r}
+ChronicUntr.trt <- readRDS(paste0(subpath, "/", groupLabels[10] ,"_GSEA_canonical_pathways.rds"))
+ChronicUntr.trt <- ChronicUntr.trt@result
+```
+
+```{r}
+write_tsv(TPMCountsNorm, paste0(path, "/Caliberated_data/TPMNormsCount.tsv"))
+```
+
+```{r}
+library(WGCNA)
+SampleMeta <- read_tsv(paste0(path, "/WGCNA_metadata.tsv"))
+txi.kallisto <- readRDS(paste0(path, "/kallisto_object.rds"))
+
+#DESeq2
+dds <- DESeqDataSetFromTximport(txi.kallisto, SampleMeta, ~1)
+
+#remove low quality reads
+dds <- subset(dds, subset = apply(assay(dds), 1,max) >= 10)
+dds <- dds[!rownames(dds) %in% mitogene$gene_symbol,]
+
+deRNA <- DESeq(dds)
+
+#vst
+deWGCNA <- vst(assay(dds))
+
+#Norms count
+deNormWGCNA <- as.data.frame(counts(deRNA, normalized = T))
+
+# Looking for outlier genes
+gsg <- goodSamplesGenes(t(deNormWGCNA), verbose = 3)
+
+# Normalized Data for Co-expression analysis
+dfWGCNANorm <- t(deNormWGCNA)
+write_tsv(as.data.frame(dfWGCNANorm) |> rownames_to_column("ID"), paste0(location, "/dfWGCNAnorms.tsv"))
+power <- c(c(1:10), seq(from = 12, to = 50, by =2))
+
+#Call the network topology analysis function
+sft <- pickSoftThreshold(dfWGCNANorm, powerVector = power, networkType = "signed")
+sft.thres <- sft$fitIndices
+sft$powerEstimate
+
+
+#Ploting power
+plot_grid(nrow = 2,
+  ggplot(sft.thres, aes(x=Power, y = SFT.R.sq))+
+  geom_point()+
+  geom_hline(yintercept = 0.8, color = "red")+
+  xlab("Power")+
+  ylab("R^2")+
+  theme_bw(),
+ggplot(sft.thres, aes(x=Power, y = mean.k.))+
+  geom_point()+
+  xlab("Power")+
+  ylab("mean connectivity")+
+  theme_bw())
+
+
+```
+
+```{r}
+dirc <- "Co-expression_Analysis"
+if (!dir.exists(file.path(path, dirc))){
+  dir.create(file.path(path, dirc))
+  location <- file.path(path, dirc)
+}else{
+  location <- file.path(path, dirc)
+}
+# Making Weighted Matrix
+cor <- WGCNA::cor
+
+bwnet <- blockwiseModules(dfWGCNANorm,
+  maxBlockSize = nrow(dfWGCNANorm), # What size chunks (how many genes) the calculations should be run in
+  TOMType = "signed", # topological overlap matrix
+  power = sft$powerEstimate, # soft threshold for network construction
+  mergeCutHeight = 0.25, # merge module below this height
+  numericLabels = FALSE,
+  pamRespectsDendro = FALSE,
+  saveTOMs = TRUE,
+  saveTOMFileBase = "blockwiseTOM",
+  randomSeed = 1234, # there's some randomness associated with this calculation
+)
+
+saveRDS(bwnet, paste0(location, "/co-expression_module_norm.rds"))
+```
+
+```{r}
+
+bwnet <- readRDS(paste0(location, "/co-expression_module_norm.rds"))
+
+
+module_eigengenes <- bwnet$MEs
+
+
+# Number of genes in each color cluster
+table(bwnet$colors)
+
+block_genes <- bwnet$blockGenes[[10]]  # Genes retained in the first block
+#Ploting the dendogram
+plotDendroAndColors(
+  dendro = bwnet$dendrograms[[1]], 
+  colors = cbind(bwnet$unmergedColors, bwnet$colors),
+  groupLabels = c("unmerged", "merged"),
+  dendroLabels = FALSE,
+  addGuide = TRUE,
+  hang = 0.03,
+  guideHang = 0.05
+)
+print(paste("Unmerged modules:", length(unique(bwnet$unmergedColors))))
+print(paste("Merged modules:", length(unique(bwnet$colors))))
+
+plotDendroAndColors(
+  dendro = bwnet$dendrograms[[1]],
+  colors = cbind(
+    bwnet$unmergedColors[bwnet$blockGenes[[1]]],  # Align colors with dendrogram leaves
+    bwnet$colors[bwnet$blockGenes[[1]]]
+  ),
+  groupLabels = c("Unmerged (317)", "Merged (53)"),  # Label with module counts
+  dendroLabels = FALSE,
+  addGuide = TRUE,
+  hang = 0.03,
+  guideHang = 0.05
+)
+bwnet$blockGenes
+```
+
+```{r}
+SampleMeta <- read_tsv(paste0(path, "/WGCNA_metadata.tsv"))
+colnames(SampleMeta)[3] <- "Protocol"
+SampleMeta$Group<- NULL
+
+DrugWGCNA <- binarizeCategoricalColumns(SampleMeta$Drug, includePairwise = F,
+                           includeLevelVsAll = T, minCount = 1)
+DrugWGCNA <- DrugWGCNA |> mutate(data.M.vs.all.new =  if_else(is.na(data.M.vs.all), 0, data.M.vs.all)) |> select(2)
+
+colnames(DrugWGCNA)[1] <- "data.M.vs.all"
+
+SampleMeta$Drug <- factor(SampleMeta$Drug)
+SampleMeta$Protocol <- factor(SampleMeta$Protocol)
+
+ProtocolWGCNA <- binarizeCategoricalColumns(SampleMeta$Protocol, includePairwise = F,
+                           includeLevelVsAll = T, minCount = 1)
+SampleMeta <- SampleMeta |> mutate(data.A.vs.all = if_else(Protocol == "Acute", 1, 0))
+ProtocolWGCNA <- cbind(SampleMeta$data.A.vs.all, ProtocolWGCNA)
+colnames(ProtocolWGCNA)[1] <- "data.Acute.vs.all"
+
+traits <- cbind(DrugWGCNA, ProtocolWGCNA)
+colnames(traits) <- c("M3814", "Acute", "Chronic", "Naive", "Restim")
+nSamples <- nrow(dfWGCNANorm)
+nGenes <- ncol(dfWGCNANorm)
+
+# module trait correlation 
+
+ModuleTrait.Corr <- stats::cor(module_eigengenes, traits, use = 'p')
+ModuleTrait.Corr.pvals <- corPvalueStudent(ModuleTrait.Corr, nSamples)
+
+
+# Module trait heatmap
+
+heatMap <- cbind(module_eigengenes, traits)
+
+cor <- stats::cor
+
+library(CorLevelPlot)
+png(paste0(location, "/correlations_to_module_norm.png"), width = 560, height = 840)
+CorLevelPlot(heatMap, y = names(heatMap)[1:53], x = names(heatMap)[54:58],
+             col = c(  "blue1", "skyblue", "white", "pink", "red2"))
+dev.off()
+ggsave(paste0(location, "/correlations_to_module_norm.png"), width = 8, height = 12)
+```
+
+```{r}
+# Extract module colors (labels)
+moduleColors <- as.data.frame(bwnet$colors)
+modulePink <- moduleColors |> filter(`bwnet$colors` == "pink")
+modulePaleturquoise <- moduleColors |> filter(`bwnet$colors` == "paleturquoise")
+
+# Module membership
+module.membership <- cor(module_eigengenes, dfWGCNANorm, use = 'p')
+module.membership.pvals <- corPvalueStudent(module.membership, nSamples)
+# module.membership.pvals <- subset(module.membership.pvals)
+# For each module, select genes with the highest kME
+hubGenes <- list()
+modules <- unlist(as.vector(unique(moduleColors)))
+
+for (mod in modules) {
+  modGenes <- (moduleColors == mod)
+  kME <- module.membership[paste0("ME", mod), modGenes]
+  topHub <- names(sort(kME, decreasing = TRUE))[1:min(10, length(kME))]  # Top 10 genes
+  hubGenes[[mod]] <- topHub
+}
+
+saveRDS(hubGenes, paste0(location, "/Hub_genes_based_on each_module.RDS"))
+
+hubGene_module.membership <- readRDS("C:\\Sen_lab_2025\\DD04_Cansu\\output_data_folder\\RNA_Seq\\Co-expression_Analysis\\Hub_genes_based_on each_module.RDS")
+```
+
+```{r}
+# Intramodular connectivity (kWithin)
+TOM <- TOMsimilarityFromExpr(dfWGCNANorm, power = 8)
+colnames(TOM) <-  colnames(dfWGCNANorm)
+
+IMConn <- intramodularConnectivity(TOM, moduleColors$`bwnet$colors`)
+
+IMConn <-  cbind(IMConn,moduleColors$`bwnet$colors`)
+colnames(IMConn)[5] <- "moduleColors"
+write_tsv(IMConn, paste0(location, "/intramodular_connectivity.tsv"))
+
+# For each module, select genes with the highest kME
+hubGenes <- list()
+modules <- unlist(as.vector(unique(moduleColors)))
+
+for (mod in modules) {
+  modGenes  <- (moduleColors == mod)
+  modIMConn  <- IMConn[modGenes, ]
+  # topHub <- # Sort by kWithin
+  topHub <- rownames(modIMConn)[order(modIMConn$kWithin, decreasing = TRUE)]
+  hubGenes[[mod]] <- topHub
+}
+saveRDS(hubGenes, paste0(location, "/Hub_genes_based_on each_module_Connectivity.RDS"))
+
+```
+
+```{r}
+# For cytoscape visualization
+for (mod in modules) {
+  modGenes  <- (moduleColors == mod)
+  # Subset TOM to those genes
+  modTOM <- TOM[modGenes, modGenes]
+  # Export edge and node lists for Cytoscape
+  edgeFile <- paste0(location, "/CytoscapeInput-edges-", mod, ".txt")
+  nodeFile <- paste0(location, "/CytoscapeInput-nodes-", mod, ".txt")
+  exportNetworkToCytoscape(TOM,
+                          edgeFile = edgeFile,
+                          nodeFile = nodeFile,
+                          weighted = TRUE,
+                          threshold = 0.02,
+                          nodeNames = modGenes,
+                          # altNodeNames = altNames,
+                          nodeAttr = moduleColors[modGenes])
+}
+```
+
+```{r}
+sessionInfo()
+```

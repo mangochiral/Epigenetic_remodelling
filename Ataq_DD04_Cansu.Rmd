@@ -1,0 +1,1096 @@
+---
+title: "Ataq_DD04_Cansu"
+author: "Chandrima"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Main Directory Folder path
+
+In this analysis pipeline each analysis will create separate folder for each step
+
+```{r}
+path = "C:/Sen_lab_2025/DD04_Cansu/output_analysis"
+```
+
+## Loading Libraries
+
+```{r}
+#set.seed(8675309) #if you set a random seed, your data will be perfectly reproducible but be careful!!
+packages <- c ("stringr","ggplot2", "reshape2", "RColorBrewer", "pheatmap", "qvalue","DESeq2",
+               "genefilter", "readr", "tidyverse", "gridExtra", "vegan", "TxDb.Hsapiens.UCSC.hg19.knownGene", 
+               "ChIPpeakAnno", "GGally", "ChIPseeker", "TxDb.Hsapiens.UCSC.hg19.knownGene",
+               "clusterProfiler","org.Hs.eg.db", "vsn", "sva", "rGREAT")
+#Load libraries
+lapply(packages, suppressPackageStartupMessages(library), character.only = T)
+```
+
+## Loading featuresCount Data and Samples table into R
+
+Features counts matrix are loaded columns are ordered (untreated, treat) as acutes, chronics, restims, naives
+
+```{r}
+#require two files (conditions file and input file of raw counts)
+dfCountData <- as.data.frame(read_tsv("C:/Sen_lab_2025/DD04_Cansu/rawCounts.bed",show_col_types = FALSE))
+dfConditions <- as.data.frame(read_tsv("C:/Sen_lab_2025/DD04_Cansu/ConditionsATACcorrect.txt",show_col_types = FALSE))
+
+# Rearranging the column order
+AcutesDMSO <- select(dfCountData, contains("AcuteDMSO"))
+AcutesM3814 <- select(dfCountData, contains("AcuteM3814"))
+ChronicsDMSO <- select(dfCountData, contains("ChronicDMSO"))
+ChronicsM3814 <- select(dfCountData, contains("ChronicM3814"))
+Restims <- select(dfCountData, contains("RestimDMSO"))
+Naives <- select(dfCountData, contains("Naive"))
+dfCountDataordered <- cbind(dfCountData[,c(1,2,3)], Naives,AcutesDMSO, AcutesM3814, ChronicsM3814, ChronicsDMSO,Restims)
+```
+
+```{r}
+# Setting output directory
+sub_dir <- "Rawdata_Corrected"
+if (!file.exists(sub_dir)){
+  dir.create(file.path(path, sub_dir))
+  location <- file.path(path, sub_dir)
+}else{
+  location <- file.path(path, sub_dir)
+}
+
+# Reassign the ordered dataframe to Count Data
+dfCountDataordered -> dfCountData
+write_tsv(dfCountData,  paste0(location, "/rawCountsReOrdered.bed"))
+
+# Order the Conditions Table
+dfConditions$Sample <- colnames(dfCountDataordered)[4:ncol(dfCountDataordered)]
+dfConditions$Group <- str_extract(dfConditions$Sample,  "Naive|AcuteM3814|AcuteDMSO|ChronicDMSO|ChronicM3814|RestimDMSO")
+
+# Adding Donor column
+dfConditions$Donor <- str_extract(dfConditions$Sample, "D45|D4|D5")
+
+# Show data frame Conditions
+dfConditions <- dfConditions |> mutate(repli = case_when(Donor == "D45" ~ "r1",
+                                                         Donor == "D4" ~ "r2",
+                                                         Donor == "D5" ~ "r3"))
+dfConditions$Corrname <- paste0(dfConditions$Group, "_",dfConditions$repli )
+write_tsv(dfConditions, paste0(location, "/ConditionsATACcorrectReOrdered.tsv"))
+```
+
+## Loading the cleaned up Data from the previous step
+
+```{r}
+# Main directory path
+path = "C:/Sen_lab_2025/DD04_Cansu/output_analysis"
+sub_dir <- "Rawdata_Corrected"
+# Peaks data
+dfCountData <- read_tsv(paste0(file.path(path, sub_dir), "/rawCountsReOrdered.bed"))
+#Conditions Data
+dfConditions <- read_tsv(paste0(file.path(path, sub_dir),"/ConditionsATACcorrectReOrdered.tsv"))
+
+```
+
+### Cleaning low quality peaks regions, wherein if for any peak region the rowSums should be greater than 10 for at least one of the samples
+
+```{r}
+# Cleaning counts data and making it to matrix for DESeq2 counts object
+dfCountData <- as.data.frame(dfCountData)
+
+# Concancate columns 1-3 setting it as rownames
+rownames(dfCountData) <- paste(dfCountData$chr, dfCountData$start, dfCountData$end, sep = "-")
+
+# Removing columns 1-3
+dfCountData <- dfCountData[,-c(1,2,3)]
+  
+# Converting the counts dataframe to matrix
+dfCountData <- as.matrix(dfCountData)
+```
+
+## To be noted
+
+Threshold can be adjusted upwards if necessary (have gone as high as 25), All rows in dfCountData where at least one value in that row is greater than 10
+
+```{r}
+# Dataframe, margin(1 for row, 2 for column) in the apply function
+dfCountData <- subset(dfCountData, subset = apply(dfCountData, 1,max) > 10)
+
+```
+
+## Final DESeq2 object for analysis
+
+```{r}
+# Converting to DESeq data type
+#Running DESeq2 to find hidden batch effect by donors
+ddseq <- DESeqDataSetFromMatrix(countData = dfCountData, colData = dfConditions, design = ~ Group)
+deATAC <- DESeq(ddseq)
+```
+
+## DESeq object overview data structure
+
+```{r}
+deATAC
+```
+
+## Exploratory Analysis
+
+Here we perform various types of normalization method to find the suitable one for our particular datasets,the QC metrics that were computed are mean to standard deviation plot, PCA, correlation between samples(here experimental conditions)
+
+##### Note that for VST normalization method we used at least 80% of the peak regions presents in out features matrix
+
+```{r}
+# Setting output directory
+path = "C:/Sen_lab_2025/DD04_Cansu/output_analysis"
+sub_dir <- "Exploratory_Analysis"
+if (file.exists(sub_dir)){
+  location <- file.path(path, sub_dir)
+}else{
+  dir.create(file.path(path, sub_dir))
+  location <- file.path(path, sub_dir)
+}
+
+
+#Variance Stabilizing Transformation of counts data supervised 
+# i.e differences between donor and treatment (the variables in the design) 
+# i.e experimental design will contribute to the expected variance-mean trend of the experiment. 
+
+vsd <- vst(deATAC, nsub = round((dim(deATAC)[1])*0.8),  blind = FALSE)
+write_tsv(as.data.frame(assay(vsd))|> rownames_to_column("ID"), paste0(location, "/vsd_supervised.tsv"))
+
+# Regularized-Logarithm Transformation of counts data supervised
+rld <- rlog(deATAC,blind = FALSE)
+write_tsv(as.data.frame(assay(rld))|> rownames_to_column("ID"), paste0(location, "/rld_supervised.tsv"))
+
+# The Normalized counts are calculated by dividing the scaling factor after correcting for donor effect
+dfNormalizedCount <- as.data.frame(counts(deATAC, normalized = T))
+
+#Save as tsv
+write_tsv(dfNormalizedCount %>% rownames_to_column(var = "ID"), paste0(location,"/NormCountsATAC.tsv"))
+
+
+#The place where scaling factor are stored is deATAC@colData after correcting for donor effect
+dfSizeFactors <- as.data.frame(deATAC@colData$sizeFactor) 
+dfSizeFactors <- dfSizeFactors |> rownames_to_column("Sample_ID")
+colnames(dfSizeFactors)[2] <- "scale_factor"
+
+#Saving the scaling factor data for IGV as tsv
+write_tsv(dfSizeFactors,paste0(location,"/SizeFactors_correct.tsv"))
+
+
+```
+
+### 1-Mean to Variance plot accross different means in samples for supervised (unranked)
+
+#### VST transformation
+
+```{r}
+meanSdPlot(assay(vsd), ranks = F)
+
+#Save plot 
+ggsave(paste0(location, "/Mean_Variance_Plot_VST_supervised.pdf"), width = 8, height = 6)
+```
+
+#### rlog Transformation
+
+```{r}
+meanSdPlot(assay(rld), ranks = F)
+
+#Save plot 
+ggsave(paste0(location, "/Mean_Variance_Plot_RLog_supervised.pdf"), width = 8, height = 6)
+```
+
+#### Normalized counts Transformation
+
+```{r}
+meanSdPlot(as.matrix(dfNormalizedCount), ranks = F)
+
+#Save plot 
+ggsave(paste0(location, "/Mean_Variance_Plot_RLog_supervised.pdf"), width = 8, height = 6)
+```
+
+### 2-Plotting for PCAs
+
+```{r}
+library(cowplot)
+# VST Transformed data
+plot_grid(ncol=2,
+          (plotPCA(vsd, intgroup = "Group", ntop = dim(deATAC)[1], pcsToUse = c(1,2))+
+             geom_point(size = 2)+
+             scale_color_manual(name = "", values = c( "Naive" = "darkgrey",
+                                           "AcuteDMSO" = "#1B7837",
+                                           "AcuteM3814" = "#7FBF7B",
+                                           "ChronicM3814" = "#FC8D59",
+                                           "ChronicDMSO"= "#D73027",
+                                           "RestimDMSO" = "#7570B3"))),
+          (plotPCA(vsd, intgroup = "Group", ntop = dim(deATAC)[1], pcsToUse = c(1,3))+
+             geom_point(size = 2)+
+             scale_color_manual(name = "", values = c( "Naive" = "darkgrey",
+                                           "AcuteDMSO" = "#1B7837",
+                                           "AcuteM3814" = "#7FBF7B",
+                                           "ChronicM3814" = "#FC8D59",
+                                           "ChronicDMSO"= "#D73027",
+                                           "RestimDMSO" = "#7570B3"))),
+          (plotPCA(vsd, intgroup = "Group", ntop = dim(deATAC)[1], pcsToUse = c(2,3))+
+             geom_point(size = 2)+
+             scale_color_manual(name = "", values = c( "Naive" = "darkgrey",
+                                           "AcuteDMSO" = "#1B7837",
+                                           "AcuteM3814" = "#7FBF7B",
+                                           "ChronicM3814" = "#FC8D59",
+                                           "ChronicDMSO"= "#D73027",
+                                           "RestimDMSO" = "#7570B3")))
+          )
+
+
+ggsave(paste0(location, "/PCAs_VST_supervised.pdf"), width = 8, height = 6)
+
+# plotPCA(vsd_uns, intgroup = "Group", pcsToUse = 1:10)
+# ggsave(paste0(path, "pca12_vst_unsupervised.png"), width = 8, height = 6)
+```
+
+```{r}
+# rlog Transformation
+
+plot_grid(ncol=2,
+          (plotPCA(rld, intgroup = "Group", ntop = dim(deATAC)[1], pcsToUse = c(1,2))+
+             geom_point(size = 2)+
+             scale_color_manual(name = "", values = c( "Naive" = "darkgrey",
+                                           "AcuteDMSO" = "#1B7837",
+                                           "AcuteM3814" = "#7FBF7B",
+                                           "ChronicM3814" = "#FC8D59",
+                                           "ChronicDMSO"= "#D73027",
+                                           "RestimDMSO" = "#7570B3"))),
+          (plotPCA(rld, intgroup = "Group", ntop = dim(deATAC)[1], pcsToUse = c(1,3))+
+             geom_point(size = 2)+
+             scale_color_manual(name = "", values = c( "Naive" = "darkgrey",
+                                           "AcuteDMSO" = "#1B7837",
+                                           "AcuteM3814" = "#7FBF7B",
+                                           "ChronicM3814" = "#FC8D59",
+                                           "ChronicDMSO"= "#D73027",
+                                           "RestimDMSO" = "#7570B3"))),
+          (plotPCA(rld, intgroup = "Group", ntop = dim(deATAC)[1], pcsToUse = c(2,3))+
+             geom_point(size = 2)+
+             scale_color_manual(name = "", values = c( "Naive" = "darkgrey",
+                                           "AcuteDMSO" = "#1B7837",
+                                           "AcuteM3814" = "#7FBF7B",
+                                           "ChronicM3814" = "#FC8D59",
+                                           "ChronicDMSO"= "#D73027",
+                                           "RestimDMSO" = "#7570B3")))
+          )
+ggsave(paste0(location, "/PCAs_RLog_supervised.pdf"), width = 8, height = 6)
+
+# plotPCA(rld_uns, intgroup = "Group", pcsToUse = 1:10)
+# ggsave(paste0(path, "pca12_rld_unsupervised.png"), width = 8, height = 6)
+```
+
+### PCA for Normalized data
+
+```{r}
+# Resetting the analysis path
+sub_dir <- "Exploratory_Analysis"
+location <- file.path(path, sub_dir)
+
+# Loading in Normalized counts data
+dfNormalizedCount <- read_tsv(paste0(location,"/NormCountsATAC.tsv")) |> column_to_rownames("ID")
+
+# Filter any various beyond 0.2
+dfNormVarFilter <- varFilter(as.matrix(dfNormalizedCount), var.cutoff = 0.2, filterByQuantile = T)
+
+# Run PCA
+dfNormPCA <- prcomp(t(dfNormVarFilter), center = T, scale. = T)
+
+# Calculate the Percentage of Variance Explained by PCs
+percentVar <- ((dfNormPCA$sdev)^2 / sum(dfNormPCA$sdev^2)) * 100
+
+#Plot for PC1 and PC2
+library(cowplot)
+plot_grid(ncol = 2,
+  ggplot(dfNormPCA$x, aes(x= dfNormPCA$x[,1], y = dfNormPCA$x[, 2], colour = dfConditions$Group))+
+  geom_point(size = 2)+
+  xlab( paste0("PC1: ", round(percentVar[1]), "%"))+
+  ylab(paste0("PC2: ", round(percentVar[2]), "%"))+
+  scale_color_manual(name = "", values = c( "Naive" = "darkgrey",
+                                           "AcuteDMSO" = "#1B7837",
+                                           "AcuteM3814" = "#7FBF7B",
+                                           "ChronicM3814" = "#FC8D59",
+                                           "ChronicDMSO"= "#D73027",
+                                           "RestimDMSO" = "#7570B3")),
+  ggplot(dfNormPCA$x, aes(x= dfNormPCA$x[,1], y = dfNormPCA$x[, 3], colour = dfConditions$Group))+
+  geom_point(size = 2)+
+  xlab( paste0("PC1: ", round(percentVar[1]), "%"))+
+  ylab(paste0("PC3: ", round(percentVar[3]), "%"))+
+  scale_color_manual(name = "", values = c( "Naive" = "darkgrey",
+                                           "AcuteDMSO" = "#1B7837",
+                                           "AcuteM3814" = "#7FBF7B",
+                                           "ChronicM3814" = "#FC8D59",
+                                           "ChronicDMSO"= "#D73027",
+                                           "RestimDMSO" = "#7570B3")),
+  
+ ggplot(dfNormPCA$x, aes(x= dfNormPCA$x[,2], y = dfNormPCA$x[, 3], colour = dfConditions$Group))+
+  geom_point(size = 2)+
+  xlab( paste0("PC2: ", round(percentVar[2]), "%"))+
+  ylab(paste0("PC3: ", round(percentVar[3]), "%"))+
+  scale_color_manual(name = "", values = c( "Naive" = "darkgrey",
+                                           "AcuteDMSO" = "#1B7837",
+                                           "AcuteM3814" = "#7FBF7B",
+                                           "ChronicM3814" = "#FC8D59",
+                                           "ChronicDMSO"= "#D73027",
+                                           "RestimDMSO" = "#7570B3")) 
+  
+)
+
+ggsave(paste0(location, "/PCAs_normalized_data.pdf"), width = 8, height = 6)
+
+```
+
+### Sample to Sample Heatmap
+
+We perform both spearman and pearson correlation and plot them, we plot for both correlation method for VST and look for which correlation matrix well explains the similarity between conditions and there replicates, next we compute the dendogram leaves in order to align to our colnames of features counts dataset
+
+```{r}
+# Spearman correlation co-efficients between Conditions for VST transformed data
+library(dendextend)
+# Create Correlation co-efficient matrix
+sampleCorVsd <- cor(assay(vsd),  method = "spearman")
+
+# Add row/column names if needed
+rownames(sampleCorVsd) <- dfConditions$Corrname
+colnames(sampleCorVsd) <- dfConditions$Corrname
+
+# Create color palette
+colors <- colorRampPalette(brewer.pal(9, "Blues"))(100)
+
+# Compute hierarchical clustering for columns
+col_clusters <- hclust(dist(t(sampleCorVsd)))
+
+# Convert to dendrogram
+col_dend <- as.dendrogram(col_clusters)
+
+# Reorder dendrogram to match column names
+col_dend_reordered <- as.hclust(rotate(col_dend, order = colnames(sampleCorVsd)))
+
+# Create heatmap
+pheatmap(sampleCorVsd,
+         cluster_rows = F, cluster_cols = col_dend_reordered, col = colors)
+
+# To save heatmap
+pheatmap(sampleCorVsd,
+         cluster_rows = FALSE, cluster_cols = col_dend_reordered,
+         col = colors, filename = paste0(location, "/VST_Spearman_correlation_plot.pdf"), width = 8, height = 6)
+```
+
+### Pearson correlation co-efficients between Conditions for VST transformed data
+
+```{r}
+# Create Correlation co-efficient matrix using pearson
+sampleCorVsd.P <- cor(assay(vsd),  method = "pearson")
+
+# Add row/column names if needed
+rownames(sampleCorVsd.P) <- dfConditions$Corrname
+colnames(sampleCorVsd.P) <- dfConditions$Corrname
+
+# Create color palette
+colors <- colorRampPalette(brewer.pal(9, "Blues"))(100)
+
+
+# Compute hierarchical clustering for columns
+col_clusters <- hclust(dist(t(sampleCorVsd.P)))
+
+# Convert to dendrogram
+col_dend <- as.dendrogram(col_clusters)
+
+# Reorder dendrogram to match column names
+col_dend_reordered <- as.hclust(rotate(col_dend, order = colnames(sampleCorVsd.P)))
+
+# Create heatmap
+pheatmap(sampleCorVsd,
+         cluster_rows = F, cluster_cols = col_dend_reordered, col = colors)
+
+# To save heatmap
+pheatmap(sampleCorVsd.P,cluster_rows = FALSE, cluster_cols = col_dend_reordered,
+         col = colors, filename = paste0(location,"/VST_Pearson_correlation_plot.pdf"), width = 8, height = 8)
+```
+
+#### Spearman correlation co-efficients between Conditions for Normalized transformed data
+
+```{r}
+# Create Correlation co-efficient matrix
+sampleCorNorm <- cor(dfNormalizedCount,  method = "spearman")
+
+
+# Add row/column names if needed
+rownames(sampleCorNorm) <- dfConditions$Corrname
+colnames(sampleCorNorm) <- dfConditions$Corrname
+
+
+# Create color palette
+colors <- colorRampPalette(brewer.pal(9, "Blues"))(100)
+
+# Compute hierarchical clustering for columns
+col_clusters <- hclust(dist(t(sampleCorNorm)))
+
+# Convert to dendrogram
+col_dend <- as.dendrogram(col_clusters)
+
+# Reorder dendrogram to match column names
+col_dend_reordered <- as.hclust(rotate(col_dend, order = colnames(sampleCorNorm)))
+
+#To create HeatMap
+pheatmap(sampleCorNorm,col = colors,cluster_rows = FALSE, cluster_cols = col_dend_reordered)
+
+#To save HeatMap
+pheatmap(
+  sampleCorNorm,
+  col = colors,
+  cluster_rows = FALSE,
+  cluster_cols = col_dend_reordered,
+  filename = paste0(location, "/Normalized_counts_spearman_correlation_plot.pdf"), width = 8, height = 6)
+
+
+```
+
+## Differential Accessible regions Analysis
+
+### Generate All Pairwise Comparisons or Read in Specific Subset
+
+#### Making labels for merged dataframe for pairwise comparison
+
+```{r}
+# Setting Output directory
+path = "C:/Sen_lab_2025/DD04_Cansu/output_analysis"
+sub_dir <- "Differential_Accessible_regions_Analysis"
+if (file.exists(sub_dir)){
+  location <- file.path(path, sub_dir)
+}else{
+  dir.create(file.path(path, sub_dir))
+  location <- file.path(path, sub_dir)
+}
+
+# Setting the samples as factors
+dfConditions$Group <- as.factor(dfConditions$Group)
+
+# Taking in combinations of two samples to create pairwise samples
+dfPairwiseCond <- as.data.frame(combn(levels(dfConditions$Group), 2))
+
+#Converting to list type
+liPairwiseCond <- as.list(dfPairwiseCond)
+liPairwiseCond <- lapply(liPairwiseCond, as.character)
+
+#Converting in labels into a vector after pasting the pairs
+groupLabels <- unlist(lapply(liPairwiseCond, function(x) {
+  paste(x[[1]], "vs", x[[2]])}))
+```
+
+## Generate Comparison Results
+
+##### Here this is helper function for combining all the pairwise comparison pvals,padjs,and logfoldchange. The are save in one list object can any of the dataframe can be extract using the "\$" sign
+
+```{r}
+# Function for generating pairwaise comparison between each sample
+PairwiseComparison <- function(deseq, dfpaircombination) {
+  # Initialize empty data frames to store results qvals, foldchange and pvals
+  dfQvals <- data.frame()
+  dfFoldC <- data.frame()
+  dfPvals <- data.frame()
+  
+  # Loop through each comparison in dfconditions
+  for (i in seq_len(ncol(dfpaircombination))) {
+    # Comparing Row 1 vs Row 2 for each combination
+    comparison_name <- paste(dfpaircombination[1,i], "vs", dfpaircombination[2,i])
+    print(paste("Calculating results for comparison", comparison_name))
+    
+    # Get DESeq2 results for this comparison
+    resComp <- results(deseq, contrast = c("Group", dfpaircombination[1,i], dfpaircombination[2,i]))
+    write_tsv(as.data.frame(resComp)|> rownames_to_column("ID"), paste0(location,"/",dfpaircombination[1,i], "vs", dfpaircombination[2,i],".tsv"))
+    # Add results to the respective data frames
+    dfQvals[rownames(resComp), paste0(comparison_name, "_padj")] <- resComp$padj
+    dfFoldC[rownames(resComp), paste0(comparison_name, "_fc")] <- resComp$log2FoldChange
+    dfPvals[rownames(resComp), paste0(comparison_name, "_pval")] <- resComp$pvalue
+  }
+  
+  # Return all results as a list
+  return(list(qvals = dfQvals, fc = dfFoldC, pvals = dfPvals))
+}
+```
+
+```{r}
+# Pairsewise comparison analysis data
+# The first argument is DESeq2 object and second argument is the combinations dataframe
+ComparisonAnalysis <- PairwiseComparison(deseq = deATAC, dfpaircombination = dfPairwiseCond)
+```
+
+#### Calculating number of NA peaks
+
+```{r}
+# Number NA peak counts
+na_count <-sapply(ComparisonAnalysis$qvals, function(y) sum(length(which(is.na(y)))))
+na_count <- data.frame(na_count) 
+na_count <- na_count |> rownames_to_column("Groups")
+write_tsv(na_count, paste0(location, "/number_NA_peak_counts.tsv"))
+
+# Setting padj NA values to 1 to make not significant based on FDR correction (padj)
+dfQvals <- ComparisonAnalysis$qvals
+dfQvals[is.na(dfQvals)] <- 1
+```
+
+## Mark Significant Peaks
+
+Performing element-wise multiplication, resulting in the marking of any peak with qvalue (using all comparisons) greater than zero as -1 if the ATAC-seq reads are less frequent (A \< B in A vs B) and as 1 if A \> B
+
+#### New code
+
+```{r}
+matQValsPerComparison <- as.matrix(dfQvals)
+# Converting padj value df to matrix
+# matBelowQ <- as.matrix(dfQvals)
+matBelowQ <- matQValsPerComparison < 0.05
+# If adjusted significance value is greater than critical value, those value are set to zero
+# matBelowQ[matBelowQ >= 0.05] <- 0
+# # Replace NA with 0
+# matBelowQ[is.na(matBelowQ)] <- 0
+```
+
+#### Significance of regions are calculated by multiplying logFC with adjusted p-Value to identity up or down regulation
+
+```{r}
+# Multiply padj matrix to logFC dataframe
+matPeakType <- matBelowQ * ComparisonAnalysis$fc
+
+# Renaming conditions and Significance  
+colnames(matPeakType) <- paste0(groupLabels, "_Sig")
+
+# Marking 1 for upregulated -1 for downregulated
+matPeakType[matPeakType > 0] <- 1
+matPeakType[matPeakType < 0] <- (-1)
+
+write_tsv(matPeakType, paste0(location, "/peak_of_significance.tsv"))
+```
+
+### Plot \# of differential peaks in all comparisons
+
+```{r}
+matPeakType <- read_tsv(paste0(location, "/peak_of_significance.tsv"))
+all_comp_signi <- matPeakType %>% 
+  # select(contains("Sig")) %>%
+  pivot_longer(cols = everything(), names_to = "comparison", values_to = "sig")%>% 
+  filter(sig != 0)
+
+# Compiling the number of picks
+all_comp_signi <- all_comp_signi |>
+  group_by(comparison, sig) |>
+  summarise(count = n()) |> mutate(com_peaks = sig*count) |> select(c(1,4)) 
+
+# Selecting a few comparison
+all_comp_signi_selected <- subset(all_comp_signi, comparison %in% c("AcuteDMSO vs ChronicDMSO_Sig",
+                                                         "AcuteDMSO vs RestimDMSO_Sig",
+                                                         "ChronicDMSO vs RestimDMSO_Sig",
+                                                         "ChronicDMSO vs ChronicM3814_Sig",
+                                                         "AcuteDMSO vs AcuteM3814_Sig" ))
+# Reordering the selected rows
+all_comp_signi_selected$comparison <- factor(all_comp_signi_selected$comparison, levels =  
+                                               c("AcuteDMSO vs ChronicDMSO_Sig",
+                                                 "AcuteDMSO vs RestimDMSO_Sig",
+                                                 "ChronicDMSO vs RestimDMSO_Sig",
+                                                 "ChronicDMSO vs ChronicM3814_Sig",
+                                                 "AcuteDMSO vs AcuteM3814_Sig" ))
+all_comp_signi_selected <- all_comp_signi_selected[order(all_comp_signi_selected$comparison), ]
+
+ggplot(data = all_comp_signi, aes(x=com_peaks,y=comparison)) +
+  geom_col(aes(fill=com_peaks > 0),width=0.5,show.legend = FALSE) +
+  scale_fill_manual(values = c("#BDBDBD","black")) +
+  labs(x="# of peaks",y="")+
+  theme_bw()
+
+ggsave(paste0(location, "/all_comparisons_for_peak_counts.pdf"), width = 8, height = 6)
+```
+
+```{r}
+print(all_comp_signi)
+```
+
+Pairwise comparison of each experiment was to determine differential peaks for each experiment. The negative peak counts are for right hand side of the comparison, and the positives are for left hand side of the comparison.Based upon the differential peaks between pairwise comparison, it was concluded the QC metrics for Normalization align with the Differential expressed peaks between can traced back to close groups
+
+## Compile Merging all data in one Final Matrix as one metadata file
+
+```{r}
+#Making new BED dataframe with chromosome name, start and end positions
+liChrData <- strsplit(rownames(ComparisonAnalysis$qvals), "-")
+dfBED <- as.data.frame(matrix(unlist(liChrData), ncol = 3, byrow = T))
+colnames(dfBED) = c("seqnames", "start", "end")
+dfBED$ID <- rownames(ComparisonAnalysis$qvals)
+
+# Save the chromosome name and peak regions as one universe
+# write_tsv(dfBED, paste0(location, "/all_merged_peak_universe.bed"))
+
+#Making GRange object with Gene Ontology ID and  
+res = great(toGRanges(dfBED), "GO:BP", "txdb:hg19") # for human
+
+#res = great(toGRanges(dfBED), "GO:BP", "txdb:mm10")# for mouse
+
+# Getting gene names associated with chromosome location id
+dfRegionsGenes <- as.data.frame(getRegionGeneAssociations(res)) 
+
+#Chromosome name and locations are merged
+dfRegionsGenes$ID <- paste(dfRegionsGenes$seqnames, 
+                           dfRegionsGenes$start, 
+                           dfRegionsGenes$end, sep = "-")
+# Extracting columns of chromosome location id, gene names, distance from TF start site
+dfRegionsGenes <- dfRegionsGenes %>%
+  select(ID,annotated_genes,dist_to_TSS)
+
+# Join the BED dataframe and gene names dataframe and removing the chromosome location id column
+dfBEDGenes <- dplyr::left_join(dfBED,dfRegionsGenes,by="ID") %>% dplyr::select(-ID)
+
+dfBEDGenes <- dfBEDGenes %>% dplyr::rowwise() %>% 
+    dplyr::mutate(annotated_genes = paste(annotated_genes, collapse=','),dist_to_TSS = paste(dist_to_TSS, collapse=',')) %>%
+    dplyr::ungroup()
+colnames(dfBEDGenes)[4] <- "Genes"
+colnames(dfBEDGenes)[5] <- "TSS_Distances"
+
+dfOut <- as.data.frame(cbind(dfBEDGenes, dfNormalizedCount, ComparisonAnalysis$fc, ComparisonAnalysis$pvals, matQValsPerComparison, matPeakType))
+dfOut$AtLeastOnePairwiseComparisonSignificant <- rowSums(abs(matBelowQ)) > 0
+table(dfOut$AtLeastOnePairwiseComparisonSignificant)
+# write_tsv(dfOut |> rownames_to_column("ID"), paste0(location, "/Megatable.tsv"))
+
+```
+
+##### Initially Kmeans clustering was ran using dfNormalizedCount, there were no inflect point where the average silhoutte score increased which couldnot help in finding optimal number of kmeans clusters, so averaged the expression pattern for each sample and remove the naive driven differential peaks to understand the mechanism of treatment.
+
+#### Making the new Avg counts data frame
+
+```{r}
+sub_dir <- "Differential_Accessible_regions_Analysis"
+location <- file.path(path, sub_dir)
+# Reading the metatable
+# Labeling the peaks associated to Naive where any column with labels having Naive comparison 
+dfSig <- matPeakType |> select(-matches("Naive.*Sig|Sig.*Naive")) # removing the naive peaks
+
+dfOut$AtLeastOnePairwiseComparisonSignificantWithoutNaive <- rowSums(abs(dfSig)) > 0 # DARS without Naive
+table(dfOut$AtLeastOnePairwiseComparisonSignificantWithoutNaive)
+table(dfOut$AtLeastOnePairwiseComparisonSignificant)
+write_tsv(dfOut |> rownames_to_column("ID"), paste0(location, "/Megatable_without_naive_peaks.tsv"))
+```
+
+```{r}
+# Normalized Counts matrix
+dfOut <- read_tsv( paste0(location, "/Megatable_without_naive_peaks.tsv")) |> column_to_rownames("ID")
+dfNorm <- read_tsv(paste0(path, "/Exploratory_Analysis/NormCountsATAC.tsv")) |> column_to_rownames("ID")
+dfNorm <- cbind(dfNorm, dfOut$AtLeastOnePairwiseComparisonSignificantWithoutNaive)
+dfNorm <- dfNorm |> filter(dfOut$AtLeastOnePairwiseComparisonSignificantWithoutNaive == "TRUE") |>
+  select(-c(18))
+write_tsv(dfNorm |>rownames_to_column("ID"), paste0(location, "/NormCounts_for_Kmeans_NoNaivePeaks.tsv"))
+dim(dfNorm)
+```
+
+```{r}
+#Compute Average for each sample the column names with each sample are isolated and average is calculated between replicates
+dfNormAvg <- data.frame()
+naives <- dfNorm |> select(contains("Naive")) |> rowMeans()
+acuteDMSO <- dfNorm |> select(contains("AcuteDMSO")) |> rowMeans()
+acuteM3814 <- dfNorm |> select(contains("AcuteM3814")) |> rowMeans()
+chronicM3814 <- dfNorm |> select(contains("ChronicM3814")) |> rowMeans()
+chronicDMSO <- dfNorm |> select(contains("ChronicDMSO")) |> rowMeans()
+restimDMSO <- dfNorm |> select(contains("Restim")) |> rowMeans()
+dfNormAvg <- cbind(naives,acuteDMSO, acuteM3814,chronicM3814,chronicDMSO,restimDMSO )
+write_tsv(as.data.frame(dfNormAvg) |> rownames_to_column("ID"), paste0(location, "/NormAvg_for_Kmeans_NoNaivePeaks.tsv"))
+
+```
+
+### Kmeans of 9
+
+```{r}
+sub_dir <- "Differential_Accessible_regions_Analysis"
+path <- "C:/Sen_lab_2025/DD04_Cansu/output_analysis"
+location <- file.path(path, sub_dir)
+library(amap)
+dfNormAvg <- read_tsv( paste0(location, "/NormAvg_for_Kmeans_NoNaivePeaks.tsv")) |> column_to_rownames("ID")
+# Removing Naive counts for Kmeans Clustering
+dfNormAvgselected <- as.data.frame(dfNormAvg) |> select(-c(1))
+set.seed(123)
+KmeansAMAP <- Kmeans(as.matrix(dfNormAvgselected), centers = 9, 
+                       iter.max = 1000, nstart = 25, method = "pearson")
+
+dfCluster <- as.data.frame(KmeansAMAP$cluster)
+colnames(dfCluster) <- "kmeans_9"
+
+dfCluster <- dfCluster |> mutate(cluster_label = case_when(kmeans_9 == 1 ~ "B",
+                                                           kmeans_9 == 2 ~ "E",
+                                                           kmeans_9 == 3 ~ "D",
+                                                           kmeans_9 == 4 ~ "I",
+                                                           kmeans_9 == 5 ~ "A",
+                                                           kmeans_9 == 6 ~ "C",
+                                                           kmeans_9 == 7 ~ "H",
+                                                           kmeans_9 == 8 ~ "F",
+                                                           kmeans_9 == 9 ~ "G"))
+
+dfKmeansAMAP <- cbind(dfCluster, dfNormAvg) |> rownames_to_column("ID")
+
+write_tsv(dfKmeansAMAP, paste0(location, "/Kmeans_9_Avg_Norm_final_reproduced.tsv"))
+```
+
+## GSEA Enrichment
+
+### For each cluster pathway enrichment was done using the GO, KEGG, BIOCARTA, Immunology library
+
+```{r}
+sub_dir <- "Differential_Accessible_regions_Analysis"
+path <- "C:/Sen_lab_2025/DD04_Cansu/output_analysis"
+location <- file.path(path, sub_dir)
+dfKmeansAMAP <- read_tsv( paste0(location, "/Kmeans_9_Avg_Norm_final_reproduced.tsv")) |> column_to_rownames("ID")
+
+dfKmeansAMAP <- dfKmeansAMAP[order(dfKmeansAMAP$cluster_label), ]
+
+# Setting Output directory
+sub_dir <- "GeneSet_Enrichment"
+if (file.exists(sub_dir)){
+  location <- file.path(path, sub_dir)
+}else{
+  dir.create(file.path(path, sub_dir))
+  location <- file.path(path, sub_dir)
+}
+
+# Get cluster labels
+unique_labels <- unique(dfKmeansAMAP$cluster_label)
+
+# Create cluster names
+cluster_names <- paste0("cluster", unique_labels)
+
+# Create a named list using the cluster names
+clustercode <- setNames(as.list(unique_labels), cluster_names)
+
+
+# Subsetting by Kmeans
+EnrichCluster <- lapply(clustercode, function(i) {
+  # Create the data frame from split rownames
+  cluster_coords <- as.data.frame(
+    matrix(
+      unlist(strsplit(rownames(subset(dfKmeansAMAP, cluster_label == i)), "-")), 
+      ncol = 3, 
+      byrow = TRUE
+    )
+  )
+  
+  # Set column names
+  colnames(cluster_coords) <- c("seqnames", "start", "end")
+  
+  # Return the data frame
+  cluster_coords
+})
+
+saveRDS(EnrichCluster, paste0(location, "/", "Enriched_regions_bed_format.RDS"))
+
+backgroundPeaks <-  as.data.frame(matrix(unlist(strsplit(rownames(dfKmeansAMAP), "-")), ncol = 3, 
+                                         byrow = TRUE))
+
+# Set column names
+colnames(backgroundPeaks) <- c("seqnames", "start", "end")
+
+write_tsv(backgroundPeaks, paste0(location, "/", "backgroundPeaks.bed"))
+backgroundPeaksdata <- toGRanges(backgroundPeaks)
+
+Enrichment <- lapply(EnrichCluster, function(i) {
+  # Run analyses with correct collection names from MSigDB
+  res.Go <- great(toGRanges(i), "c5.go.bp", "txdb:hg19", background = backgroundPeaksdata)
+  res.Kegg <- great(toGRanges(i), "c2.cp.kegg", "txdb:hg19", background = backgroundPeaksdata)
+  res.Biocart <- great(toGRanges(i), "c2.cp", "txdb:hg19", background = backgroundPeaksdata)  # BIOCARTA is part of c2.cp
+  res.Imm <- great(toGRanges(i), "c7.immunesigdb", "txdb:hg19", background = backgroundPeaksdata)
+  
+  # Return all results in a list
+  list(
+    GO = res.Go,
+    KEGG = res.Kegg,
+    BIOCARTA = res.Biocart,
+    Immunology = res.Imm
+  )
+})
+saveRDS(Enrichment, paste0(location, "/All_Enrichment_0f_Cluster_without_Naive_peaks.RDS"))
+
+```
+
+##### Hockey plots to ranking of the genes for each cluster.
+
+It done by summing each gene appeared in each cluster and order them in ascending order where the higher the number of counts higher the rank.The commented block of code refers to different way of ranking wherein if two gene have same counts they share the same rank.Not to be used.
+
+```{r}
+RankGenomicRegions <- function(x, listkey){
+  # Take the GO terms table to get the genes associated to the chromosome location and make it as a dataframe
+  df <- as.data.frame(getRegionGeneAssociations(x[[listkey]]$GO))
+  
+  # Reserve the gene pairs from the annotated gene list
+  df[["Gene_Pair"]] <- df[["annotated_genes"]]
+  
+  # Unlist the annotated gene column
+  df <- unnest(df, annotated_genes)
+  
+  # Paste chromosome number, start and end location as ID
+  df[["ID"]] <- paste(df[["seqnames"]], df[["start"]], df[["end"]], sep = "-") 
+  
+  # Rearrange the dataframe
+  df <- df |> select(-c(1,2,3)) |> cbind(df[,6], df[, -c(6)]) |>  select(c("ID", "annotated_genes", "dist_to_TSS", "Gene_Pair" ))
+  
+  # Group by genes and count
+  gene_counts <- df %>%
+    group_by(annotated_genes) %>% # Group by genes
+    summarise(
+      count = n(), # Count how many locations were there for each gene
+      IDs = paste(unique(ID), collapse = ", ") # Paste the location IDs associated to the gene
+    ) |>
+    # arrange(count) |>
+    # mutate(Rank = dense_rank(count)) |>
+    # arrange(desc(count)) |> 
+    # mutate(Rank_Priority = dense_rank(desc(count)))
+    
+    # For older method of ranking
+    arrange(count) |>
+    mutate(Rank = row_number()) |>
+    arrange(desc(count)) |>
+    mutate(Rank_Priority = row_number())
+ 
+  # Rename the column 2 to genes
+  colnames(gene_counts)[1] <- "Genes"
+  
+  return(gene_counts)
+}
+```
+
+## Note before running this chunk of code make sure you have the homer motif files in "cluster_gene_rank_association" folder/directory
+### Running ranking plots for each cluster
+
+```{r}
+Enrichment <- readRDS(paste0(location, "/All_Enrichment_0f_Cluster_without_Naive_peaks.RDS"))
+
+library(ggrepel)
+
+
+in_dir <- "cluster_gene_rank_association"
+output_dir <- file.path(location, in_dir)
+
+# Looping for all the clusters
+if (!dir.exists(output_dir)){
+  dir.create(output_dir)
+  output_dir <- file.path(location, in_dir)}
+for (i in 1:length(names(Enrichment))){
+  dfRegions <- RankGenomicRegions(Enrichment, names(Enrichment)[i])
+  write_tsv(dfRegions, paste0(output_dir,"/", names(Enrichment)[i],"_gene_associated_regions_count.tsv"))
+  
+ 
+  
+  ggplot(dfRegions, aes(x = Rank, y = count, label = Genes)) +
+    geom_point() +
+    geom_text_repel(
+      aes(label = ifelse(Rank_Priority < 8, as.character(Genes), "")), box.padding = 0.8, point.padding = 0.5,
+      force = 20,max.overlaps = 30, segment.color = "grey70", segment.size = 0.2,segment.alpha = 0.7,
+      nudge_x = 10,nudge_y = 0.5, direction = "both",      # Allow both horizontal and vertical movement
+      hjust = 0,               # Left-align text
+      size = 3,                # Smaller text
+      fontface = "bold",       # Bold labels for better visibility
+      seed = 42                # Set seed for reproducible label placement
+    )+
+    
+    theme_bw()
+  
+  ggsave(paste0(output_dir,"/", names(Enrichment)[i],"_rank_elbow.pdf"), 
+         width = 8, height = 6)
+}
+
+```
+
+### Pulling Ranks of each gene for all cluster
+
+```{r}
+Rankcall <- function(x){
+  # Initialize using cluster 1
+  GeneRankperCluster <- read_tsv(paste0(output_dir,"/",
+                                        "clusterA","_gene_associated_regions_count.tsv"))
+  GeneRankperCluster <- GeneRankperCluster |> select(c("Genes", "Rank"))
+  names(GeneRankperCluster)[2] <- paste0("Rank.clusterA")
+  # Loop through clusters 2-9 and merge
+  for(i in cluster_names[2:9]) {
+    current_cluster <- read_tsv(paste0(output_dir,"/",
+                                       i,"_gene_associated_regions_count.tsv"))
+    temp_df <- data.frame(Genes = current_cluster$Genes,Rank = current_cluster$Rank)
+    names(temp_df)[2] <- paste0("Rank.", i)
+    if(x == F){
+      # Merging by Intersecting genes
+      GeneRankperCluster <- merge(GeneRankperCluster, temp_df, by = "Genes", all = F) 
+    }else{
+      GeneRankperCluster <- merge(GeneRankperCluster, temp_df, by = "Genes", all = T) 
+    }
+  }
+  return(GeneRankperCluster)
+}
+
+union_call <-  Rankcall(T)
+write_tsv(union_call, paste0(location,"/", "All_genes_in_all_cluster.tsv"))
+# intersection_call <- Rankcall(F)
+# write_tsv(intersection_call, paste0(path,"/",  "Only_genes_present_in_all_cluster.tsv"))
+
+```
+
+## Here we do motif enrichment for each cluster to be ran in HOMER
+
+##### Making bed files for each cluster for Motif enrichment
+
+```{r}
+# Bed Formats
+EnrichCluster <- readRDS(paste0(location, "/", "Enriched_regions_bed_format.RDS"))
+
+sub_dir <- "cluster_beds"
+output_dir <- file.path(location, sub_dir)
+
+if (!dir.exists(output_dir)){
+  dir.create(output_dir)
+  for (i in 1:length(EnrichCluster)){
+    df <- as.data.frame(EnrichCluster[[i]])
+    colnames(df) <- c("#seqnames", "start", "end")
+    write_tsv(df, paste0(output_dir,"/", "dfBed_",names(EnrichCluster)[i],".bed"))
+  }
+}
+```
+
+#### Making of super Enhancer to qvals plots for each cluster.
+
+Here in the first for loop motif names and -log10 qvals are extract for each cluster and stored in a dataframe, for the second dataframe the counts of each enhancer region of a gene is being calculated as enhancer score by count-min/ max-min of each cluster, after this both of the dataframe are joined using the motif names
+
+```{r}
+# Setting sub directory path
+motif_path <- "/GeneSet_Enrichment/cluster_gene_rank_association/"
+
+# Only calling the directories in cluster_gene_association not directories inside them
+cluster_dir <- list.dirs(paste0(path, motif_path), recursive=F)
+
+# Fetching in motif cluster directory
+cluster_dir <-  grep(pattern = "motif_cluster", cluster_dir, value = T)
+
+# Cluster labels
+index_letters <- c("A", "B", "C", "D", "E", "F", "G", "H", "I")
+
+# Pull KnownMotifs data
+for (i in 1:length(cluster_dir)){
+  df <- read_tsv(paste0(cluster_dir[i], "/", "knownResults.txt"))|> 
+  select("Motif Name", "q-value (Benjamini)")|>
+  mutate(motif_name = toupper(str_extract(`Motif Name`, "^-?[^(),:_/:]+")),
+         qvals = -log10(ifelse(`q-value (Benjamini)` == 0, 10^-10, `q-value (Benjamini)`))) |> 
+  select(-c(1,2)) # Removing repeative columns
+  write_tsv(df, paste0(path, motif_path, "motif_enrichment_", index_letters[i], "_logqvals.tsv" ))
+}
+
+# Making the merge file of motifs and enhancer scores
+for (i in 1:length(cluster_dir)){
+  # The gene rank file
+  df1 <- read_tsv(paste0(path,motif_path, "cluster", index_letters[i], "_gene_associated_regions_count.tsv"))
+  df1 <- df1 |> mutate(enhancer_score = (count - min(count))/(max(count) - min(count)))
+  
+  # The Motif enrichment qvalue files
+  df2 <- read_tsv(paste0(path,motif_path,"motif_enrichment_",index_letters[i],"_logqvals.tsv"))
+  df2 <- df2 |> 
+    mutate(Genes = toupper(motif_name)) |> 
+    inner_join(df1, by = "Genes")|> 
+    select("Genes", "qvals","count", "enhancer_score") |>
+    filter(qvals > 0)
+  write_tsv(df2, paste0(path, motif_path, "superenhancer_cluster", index_letters[i], ".tsv"))
+}
+```
+
+#### Plotting the super enhancers to qvals and labelling by first ordering them high enhancer scores, and taking a cutoff of 8 for labelling the Motifs in the plot
+
+```{r}
+# Making Plots
+for (i in 1:length(cluster_dir)){
+  df <- read_tsv(paste0(path, motif_path, "superenhancer_cluster", index_letters[i], ".tsv"))
+  df <- df |> arrange(desc(enhancer_score))|> mutate(Rank = row_number())
+  ggplot(df, aes(x= qvals, y= enhancer_score, label = Rank))+
+  geom_point()+
+  geom_text_repel(
+      aes(label = ifelse(Rank < 8, as.character(Genes), "")), box.padding = 0.8, point.padding = 0.5,
+      force = 20,max.overlaps = 30, segment.color = "grey70", segment.size = 0.2,segment.alpha = 0.7,
+      hjust = 1.5,               # Left-align text
+      vjust = 1,
+      size = 3,                # Smaller text
+      fontface = "bold",       # Bold labels for better visibility
+      seed = 42                # Set seed for reproducible label placement
+    )
+  # geom_hline(yintercept = 0) + 
+  # geom_vline(xintercept = 0) +
+  # coord_cartesian(xlim = c(-(max(df$qvals)+1), max(df$qvals)+ 1), ylim = c(-(max(df$enhancer_score)+0.1),(max(df$enhancer_score)+0.1)), expand = FALSE)
+  
+  ggsave(paste0(path, motif_path, "superenhancer_cluster", index_letters[i], ".pdf"), width = 8, height = 6)
+}
+
+```
+
+#### Plotting label specific genes in the
+
+```{r}
+library(ggrepel)
+# Cluster labels
+index_letters <- c("A", "B", "C", "D", "E", "F", "G", "H", "I")
+genes_to_label <- c("ATP8B4", "ERBB4", "FAM227B", "SOX4", "IKZF2", "PTPN20", 
+                    "MAPK8", "ETS2", "GATA3", "TOX", "TCF4", "NR3C2", "CC2D2B", 
+                    "ENTPD1", "IRF2BP2", "AHR", "ZEB1", "SYK", "SPSB1", "CRTAM", 
+                    "KLF3", "CASR", "CYP11A1", "NCOA3", "ANKRD55", "KLF2", "NFIL3")
+
+# For cluster D
+df <- read_tsv(paste0(path, motif_path, "cluster", index_letters[4], "_gene_associated_regions_count.tsv"))
+
+ggplot(df, aes(x = Rank, y = count, label = Genes)) +
+    geom_point() +
+    geom_text_repel(
+      aes(label = ifelse(Genes %in% genes_to_label, as.character(Genes), "")), box.padding = 0.8, point.padding = 0.5,
+      force = 20,max.overlaps = 30, segment.color = "grey70", segment.size = 0.2,segment.alpha = 0.7,
+      nudge_x = 10,nudge_y = 0.5, direction = "both",      # Allow both horizontal and vertical movement
+      hjust = 0,               # Left-align text
+      size = 3,                # Smaller text
+      fontface = "bold",       # Bold labels for better visibility
+      seed = 42                # Set seed for reproducible label placement
+    )+
+    
+    theme_bw()
+  
+  ggsave(paste0(path, motif_path, "cluster", index_letters[4],"_rank_elbow.pdf"), 
+         width = 8, height = 6)
+  
+# For cluster E
+df <- read_tsv(paste0(path, motif_path, "superenhancer_cluster", index_letters[5], ".tsv"))
+  df <- df |> arrange(desc(qvals))|> mutate(Rank = row_number())
+  ggplot(df, aes(x= qvals, y= enhancer_score, label = Rank))+
+  geom_point()+
+  geom_text_repel(
+      aes(label = ifelse(qvals > 2.5 , as.character(Genes), "")), box.padding = 0.8, point.padding = 0.5,
+      force = 20,max.overlaps = 30, segment.color = "grey70", segment.size = 0.2,segment.alpha = 0.7,
+      hjust = 1.5,               # Left-align text
+      vjust = 1,
+      size = 3,                # Smaller text
+      fontface = "bold",       # Bold labels for better visibility
+      seed = 42                # Set seed for reproducible label placement
+    )+ theme(axis.line.x.bottom = element_line(colour = "black", size = 0.5),
+             axis.line.y.left = element_line(size = 0.5, color = "black"),
+             panel.background = element_rect(fill = "white"))
+  ggsave(paste0(path, motif_path, "superenhancer_cluster", index_letters[5], ".pdf"), width = 4, height = 3)
+```
+
+## Replicate Concordance
+
+```{r}
+dfConditions <- as.data.frame(read_tsv(paste0(path,"/Rawdata_Corrected/", "/ConditionsATACcorrectReOrdered.tsv")))
+
+dfNormData <- read_tsv(paste0(path,"/Exploratory_Analysis/","/NormCountsATAC.tsv"))
+dfNormData <- dfNormalizedCount |> rownames_to_column("ID")
+dfNormDataReps <- dfNormData |> pivot_longer(-ID, names_to = "sample", values_to = "normCount")
+dfNormDataReps <- dfNormDataReps |>  left_join(y=dfConditions, by = join_by(sample == Sample))
+
+pdf(paste0(path,"/Exploratory_Analysis/","/concordance_plot.pdf"), width = 8, height = 6)
+for (x in group_split(dfNormDataReps,Group)) {
+  plotTitle <- unique(x$Group)
+  plotData <- x |> 
+    pivot_wider(id_cols = c("ID","Group"), names_from = sample, values_from = normCount)|>
+    select(-c("ID","Group"))
+  repPlot <- ggpairs(log2(plotData + 1),title = plotTitle)
+  print(repPlot)
+}
+dev.off()
+```
+
+```{r}
+sessionInfo()
+```
